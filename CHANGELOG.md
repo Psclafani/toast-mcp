@@ -2,6 +2,31 @@
 
 Check your deployed version at `https://<your-domain>/health`.
 
+## 1.2.3 (2026-11-02)
+
+- **`toast_get_sales_summary` net sales now follow Toast's own recipe**
+  ([Calculating net sales using the orders API](https://doc.toasttab.com/doc/devguide/apiOrdersNetSalesCalculation.html)).
+  Checked against Toast Web for four business days, 1.2.2 ran high by
+  exactly the gift cards sold that day, plus a $46 check that Toast Web didn't
+  count (probably from a deleted order, since guests were +2 too).
+  - Orders and checks where `voided` or `deleted` is true, and `excessFood`
+    orders, are skipped. Deleted orders come from combining checks, so 1.2.2
+    counted those sales twice.
+  - Gift card sales and reloads (`deferred`, `TOAST_CARD_SELL`,
+    `TOAST_CARD_RELOAD`), house-account balance payments and
+    `FUNDRAISING_CAMPAIGN` service charges are subtracted from `check.amount`.
+  - Refunds are subtracted on the day they were made
+    (`refundBusinessDate`), so Gross − Discounts − Refunds = Net, as in Toast Web.
+  - New fields: `giftCardSales`, `houseAccountPayments`,
+    `fundraisingCharges`, `orderCount`, and `excluded` (counts of what was
+    skipped).
+- **Discounts** in the sales summary and `toast_get_discount_report` share
+  one rule. They count only on countable checks, skip voided and non-revenue
+  items, skip loyalty rewards removed from the check (`processingState`
+  VOID/PENDING_VOID), and count each applied discount once per check.
+- **Hourly and item sales** reports also skip deleted and excess-food orders,
+  and voided or deleted checks.
+
 ## 1.2.2 (2026-10-08)
 
 - **Menu tools now read the real Menus v2 shape.** 1.2.1 unwrapped the

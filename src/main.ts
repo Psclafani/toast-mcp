@@ -146,7 +146,7 @@ async function main() {
 
       // Health check (no secret required, reveals nothing sensitive)
       app.get('/health', (_req, res) => {
-        res.json({ status: 'ok', service: 'toast-mcp-server', version: '1.2.2' });
+        res.json({ status: 'ok', service: 'toast-mcp-server', version: '1.2.3' });
       });
 
       const port = config.port || 3000;

@@ -1,10 +1,74 @@
 ﻿import { z } from 'zod';
 import { ToastClient } from '../clients/toast.js';
-import type { Order, MenuItemSales } from '../types/index.js';
+import type { Order, Check, MenuItemSales } from '../types/index.js';
 
 /**
  * Reporting & Analytics Tools
  */
+
+// Net-sales rules follow Toast's "Calculating net sales using the orders API"
+// guide (doc.toasttab.com/doc/devguide/apiOrdersNetSalesCalculation.html):
+//  - skip orders and checks where voided or deleted is true (a deleted order is
+//    e.g. one whose check was combined into another order, so counting it
+//    would double the sale), and orders where excessFood is true;
+//  - start from check.amount, then subtract selections where deferred is true
+//    (gift card sales) or selectionType is HOUSE_ACCOUNT_PAY_BALANCE, service
+//    charges whose serviceChargeCategory is FUNDRAISING_CAMPAIGN, and refunds.
+
+/** True when an order should count toward sales (not voided/deleted/excess food). */
+export function isCountableOrder(order: Order): boolean {
+  return !order.voided && !order.deleted && !(order as any).excessFood;
+}
+
+/** True when a check should count toward sales (not voided/deleted). */
+export function isCountableCheck(check: Check): boolean {
+  return !check.voided && !check.deleted;
+}
+
+/** Gift card sales and reloads: revenue is deferred until the card is used. */
+function isGiftCardSelection(selection: any): boolean {
+  return selection.deferred === true
+    || selection.selectionType === 'TOAST_CARD_SELL'
+    || selection.selectionType === 'TOAST_CARD_RELOAD';
+}
+
+/** Selections that are not revenue for this business date (Toast guide, step 4). */
+function isNonRevenueSelection(selection: any): boolean {
+  return isGiftCardSelection(selection) || selection.selectionType === 'HOUSE_ACCOUNT_PAY_BALANCE';
+}
+
+/**
+ * Loyalty-reward discounts that were removed from the check still come back
+ * from the API with processingState VOID / PENDING_VOID (the field is null for
+ * ordinary discounts).
+ */
+function isRemovedDiscount(discount: any): boolean {
+  return discount?.processingState === 'VOID' || discount?.processingState === 'PENDING_VOID';
+}
+
+/**
+ * Calls fn once per applied discount that counts toward sales: on countable
+ * checks only, never on voided or non-revenue selections, never a removed
+ * discount, and each applied-discount guid once per check (the same discount
+ * can surface on the check and on the selections it was prorated across).
+ */
+function forEachCountedDiscount(check: Check, fn: (discount: any) => void) {
+  const seen = new Set<string>();
+  const visit = (d: any) => {
+    if (!d || isRemovedDiscount(d)) return;
+    if (d.guid) {
+      if (seen.has(d.guid)) return;
+      seen.add(d.guid);
+    }
+    fn(d);
+  };
+  check.appliedDiscounts?.forEach(visit);
+  check.selections?.forEach(selection => {
+    const sel = selection as any;
+    if (sel.voided || isNonRevenueSelection(sel)) return;
+    sel.appliedDiscounts?.forEach(visit);
+  });
+}
 
 export function registerReportingTools(client: ToastClient) {
   return [
@@ -27,64 +91,89 @@ export function registerReportingTools(client: ToastClient) {
         );
 
         let totalSales = 0;
-        let grossSales = 0;
-        let netSales = 0;
+        let salesBeforeDiscounts = 0; // check.amount less non-revenue items, before discounts are added back
         let taxAmount = 0;
         let tipAmount = 0;
         let discountAmount = 0;
         let voidAmount = 0;
         let refundAmount = 0;
+        let giftCardSales = 0;
+        let houseAccountPayments = 0;
+        let fundraisingCharges = 0;
         let guestCount = 0;
+        let orderCount = 0;
         let checkCount = 0;
+        const excluded = { voidedOrders: 0, deletedOrders: 0, excessFoodOrders: 0, voidedChecks: 0, deletedChecks: 0 };
 
         orders.forEach(order => {
+          if (order.deleted) { excluded.deletedOrders++; return; }
+          if ((order as any).excessFood) { excluded.excessFoodOrders++; return; }
           if (order.voided) {
+            excluded.voidedOrders++;
             voidAmount += order.checks.reduce((sum, check) => sum + (check.totalAmount || 0), 0);
             return;
           }
 
-          guestCount += order.numberOfGuests || 0;
-          checkCount += order.checks.length;
+          const checks = order.checks.filter(check => {
+            if (check.deleted) { excluded.deletedChecks++; return false; }
+            if (check.voided) {
+              excluded.voidedChecks++;
+              voidAmount += check.totalAmount || 0;
+              return false;
+            }
+            return true;
+          });
+          if (checks.length === 0) return;
 
-          order.checks.forEach(check => {
+          orderCount++;
+          guestCount += order.numberOfGuests || 0;
+          checkCount += checks.length;
+
+          checks.forEach(check => {
             // check.amount is Toast's net: already reduced by BOTH check-level
-            // and item-level discounts. Start there, then add every discount
-            // back into gross so gross - discounts = net (issue #1: check-level
-            // discounts used to be subtracted a second time).
-            grossSales += check.amount || 0;
+            // and item-level discounts, and it includes non-gratuity service
+            // charges. Discounts are added back below so gross - discounts = net
+            // (issue #1: check-level discounts used to be subtracted twice).
+            salesBeforeDiscounts += check.amount || 0;
             taxAmount += check.taxAmount || 0;
             totalSales += check.totalAmount || 0;
 
+            check.selections?.forEach(selection => {
+              const sel = selection as any;
+              if (sel.voided || !isNonRevenueSelection(sel)) return;
+              const price = sel.price || 0;
+              salesBeforeDiscounts -= price;
+              if (isGiftCardSelection(sel)) giftCardSales += price;
+              else houseAccountPayments += price;
+            });
+
+            check.appliedServiceCharges?.forEach(charge => {
+              if ((charge as any).serviceChargeCategory !== 'FUNDRAISING_CAMPAIGN') return;
+              const amt = charge.chargeAmount || 0;
+              salesBeforeDiscounts -= amt;
+              fundraisingCharges += amt;
+            });
+
             check.payments?.forEach(payment => {
               tipAmount += payment.tipAmount || 0;
-              if (payment.refund) {
-                refundAmount += payment.refund.refundAmount || 0;
+              // Toast Web counts a refund on the day it was made. Refunds made
+              // later on this day's orders belong to that later date; refunds
+              // made today on earlier orders are not in this order list.
+              const refund: any = payment.refund;
+              if (refund && (refund.refundBusinessDate == null || refund.refundBusinessDate === args.businessDate)) {
+                refundAmount += refund.refundAmount || 0;
               }
             });
 
-            // The same applied discount can surface on the check and again on
-            // the selections it was prorated across; count each guid once.
-            const seenDiscounts = new Set<string>();
-            const countDiscount = (d: any) => {
-              if (!d) return;
-              if (d.guid) {
-                if (seenDiscounts.has(d.guid)) return;
-                seenDiscounts.add(d.guid);
-              }
-              const amt = d.discountAmount || 0;
-              discountAmount += amt;
-              grossSales += amt;
-            };
-
-            check.appliedDiscounts?.forEach(countDiscount);
-            check.selections?.forEach(selection => {
-              if ((selection as any).voided) return;
-              (selection as any).appliedDiscounts?.forEach(countDiscount);
+            forEachCountedDiscount(check, d => {
+              discountAmount += d.discountAmount || 0;
             });
           });
         });
 
-        netSales = grossSales - discountAmount;
+        // Toast Web: Gross - Discounts - Refunds = Net Sales.
+        const grossSales = salesBeforeDiscounts + discountAmount;
+        const netSales = salesBeforeDiscounts - refundAmount;
 
         return {
           businessDate: args.businessDate,
@@ -96,10 +185,16 @@ export function registerReportingTools(client: ToastClient) {
           discountAmount,
           voidAmount,
           refundAmount,
+          giftCardSales,
+          houseAccountPayments,
+          fundraisingCharges,
           guestCount,
+          orderCount,
           checkCount,
           averageCheck: checkCount > 0 ? netSales / checkCount : 0,
           averageGuestSpend: guestCount > 0 ? netSales / guestCount : 0,
+          excluded,
+          notes: 'Net sales follow Toast\'s orders-API net-sales guide: voided/deleted orders and checks are skipped; gift card sales (giftCardSales), house account payments, fundraising charges and refunds are not net sales (refundAmount = refunds made on this business date against this date\'s orders; refunds made today on earlier orders are not included). totalSales is the sum of check totals (Toast Web "Total Amount").',
         };
       },
     },
@@ -125,7 +220,9 @@ export function registerReportingTools(client: ToastClient) {
         const hourlyData: Record<number, { sales: number; orders: number; guests: number }> = {};
 
         orders.forEach(order => {
-          if (order.voided) return;
+          if (!isCountableOrder(order)) return;
+          const checks = order.checks.filter(isCountableCheck);
+          if (checks.length === 0) return;
 
           const hour = new Date(order.openedDate).getHours();
           if (!hourlyData[hour]) {
@@ -135,7 +232,7 @@ export function registerReportingTools(client: ToastClient) {
           hourlyData[hour].orders++;
           hourlyData[hour].guests += order.numberOfGuests || 0;
 
-          order.checks.forEach(check => {
+          checks.forEach(check => {
             hourlyData[hour].sales += check.totalAmount || 0;
           });
         });
@@ -178,9 +275,10 @@ export function registerReportingTools(client: ToastClient) {
         const itemSales = new Map<string, MenuItemSales>();
 
         orders.forEach(order => {
-          if (order.voided) return;
+          if (!isCountableOrder(order)) return;
 
           order.checks.forEach(check => {
+            if (!isCountableCheck(check)) return;
             check.selections.forEach(selection => {
               if (selection.voided) return;
 
@@ -288,15 +386,7 @@ export function registerReportingTools(client: ToastClient) {
 
         const discounts: Record<string, { name: string; amount: number; count: number }> = {};
 
-        // Same applied discount can appear on the check and on the selections
-        // it was prorated across; count each guid once (matches sales summary).
-        const seenDiscounts = new Set<string>();
         const record = (discount: any) => {
-          if (!discount) return;
-          if (discount.guid) {
-            if (seenDiscounts.has(discount.guid)) return;
-            seenDiscounts.add(discount.guid);
-          }
           // Applied discounts reference the discount config as an object;
           // fall back to name so nothing lands under the literal "undefined".
           const key: string = discount?.discount?.guid || discount?.discountGuid || discount?.name || 'unknown';
@@ -307,16 +397,14 @@ export function registerReportingTools(client: ToastClient) {
           discounts[key].count++;
         };
 
+        // Same rules as toast_get_sales_summary so the totals agree: only
+        // countable orders/checks, item-level comps included, removed
+        // discounts and discounts on voided items skipped, each guid once.
         orders.forEach(order => {
+          if (!isCountableOrder(order)) return;
           order.checks.forEach(check => {
-            check.appliedDiscounts?.forEach(record);
-            // Item-level comps (loyalty rewards, single-item discounts) live on
-            // the selection, not the check. Count both.
-            check.selections?.forEach(selection => {
-              if (!(selection as any).voided) {
-                (selection as any).appliedDiscounts?.forEach(record);
-              }
-            });
+            if (!isCountableCheck(check)) return;
+            forEachCountedDiscount(check, record);
           });
         });
 
