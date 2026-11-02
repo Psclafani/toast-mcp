@@ -1,0 +1,53 @@
+{
+  "name": "@busybee3333/toast-mcp-server",
+  "version": "1.2.2",
+  "description": "Complete MCP server for Toast restaurant POS/management platform with 50+ tools and 18 React apps",
+  "type": "module",
+  "main": "dist/main.js",
+  "bin": {
+    "toast-mcp-server": "./dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/main.js",
+    "start:http": "TOAST_MCP_MODE=http node dist/main.js",
+    "prepublishOnly": "npm run build",
+    "test": "npm run build && node --test \"test/**/*.test.mjs\"",
+    "validate:live": "node scripts/validate-live.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "toast",
+    "pos",
+    "restaurant",
+    "orders",
+    "menu",
+    "labor",
+    "payments",
+    "inventory",
+    "model-context-protocol"
+  ],
+  "author": "BusyBee3333",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "axios": "^1.7.9",
+    "zod": "^3.24.1",
+    "express": "^4.18.2",
+    "cors": "^2.8.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/express": "^4.17.21",
+    "@types/cors": "^2.8.17",
+    "typescript": "^5.7.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BusyBee3333/mcpengine.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
